@@ -2,6 +2,9 @@
 PP-OCR 识别 ONNX 模型 GPU 推理：按 ``inference.yml`` 做预处理与 CTC 解码。
 
 依赖：``onnxruntime-gpu``、``PyYAML``、``opencv-python``、``numpy``。
+
+TensorRT 引擎缓存默认写在 ONNX 同目录的 ``trt_engine_cache/``，也可用环境变量
+``ORT_TRT_ENGINE_CACHE`` 或参数 ``trt_engine_cache_path`` 指定，避免每次启动重新编译。
 """
 
 from __future__ import annotations
@@ -82,6 +85,33 @@ except ImportError as e:  # pragma: no cover
 
 Array = np.ndarray
 
+# TensorRT 引擎缓存目录：可通过环境变量覆盖，便于复用、避免每次重新编译引擎。
+# 优先级：构造参数 > ORT_TRT_ENGINE_CACHE > 与 ONNX 同目录下的 trt_engine_cache
+_TRT_CACHE_ENV = "ORT_TRT_ENGINE_CACHE"
+
+
+def _resolve_trt_engine_cache_path(
+    onnx_path: Union[str, Path],
+    explicit: Optional[Union[str, Path]] = None,
+) -> str:
+    """
+    返回 TensorRT 引擎缓存目录的绝对路径字符串。
+
+    使用与 ``onnx_path`` 同目录的固定子目录（不依赖当前工作目录），程序多次运行、
+    换目录启动时仍能命中同一套缓存。
+    """
+    if explicit is not None:
+        p = Path(explicit).expanduser().resolve()
+    else:
+        env = os.environ.get(_TRT_CACHE_ENV, "").strip()
+        if env:
+            p = Path(env).expanduser().resolve()
+        else:
+            onnx = Path(onnx_path).expanduser().resolve()
+            p = onnx.parent / "trt_engine_cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
 
 def _load_inference_yml(path: Union[str, Path]) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -144,10 +174,28 @@ def _decode_ctc(
     ignored_tokens: Tuple[int, ...] = (0,),
 ) -> str:
     selection = np.ones(len(preds_idx), dtype=bool)
+
     selection[1:] = preds_idx[1:] != preds_idx[:-1]
-    for t in ignored_tokens:
-        selection &= preds_idx != t
-    char_list = [character[i] for i in preds_idx[selection] if 0 <= i < len(character)]
+
+    for ignored_token in ignored_tokens:
+        selection &= preds_idx != ignored_token
+
+    char_list = [
+        character[text_id] for text_id in preds_idx[selection]
+    ]
+
+    if preds_prob is not None:
+        conf_list = preds_prob[selection]
+    else:
+        conf_list = [1] * len(char_list)
+
+    if len(conf_list) == 0:
+        conf = 0
+    else:
+        conf = np.mean(conf_list)
+
+    text = "".join(char_list)
+
     return "".join(char_list)
 
 
@@ -191,16 +239,20 @@ def _build_provider_list(
     prefer_gpu: bool,
     gpu_mem_limit: Optional[int],
     try_trt: bool = True,
+    *,
+    trt_engine_cache_path: Optional[str] = None,
 ) -> List[Union[str, Tuple[str, Dict[str, Any]]]]:
     available = ort.get_available_providers()
     providers: List[Union[str, Tuple[str, Dict[str, Any]]]] = []
     if prefer_gpu:
         if try_trt and "TensorrtExecutionProvider" in available:
-            providers.append(("TensorrtExecutionProvider", {
+            trt_opts: Dict[str, Any] = {
                 "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": "./trt_cache",
                 "trt_fp16_enable": True,
-            }))
+            }
+            if trt_engine_cache_path:
+                trt_opts["trt_engine_cache_path"] = trt_engine_cache_path
+            providers.append(("TensorrtExecutionProvider", trt_opts))
         if "CUDAExecutionProvider" in available:
             cuda_opts: Dict[str, Any] = {}
             if gpu_mem_limit is not None:
@@ -215,13 +267,24 @@ def create_rec_session(
     *,
     prefer_gpu: bool = True,
     gpu_mem_limit: Optional[int] = None,
+    trt_engine_cache_path: Optional[Union[str, Path]] = None,
 ) -> ort.InferenceSession:
-    """创建 ONNX Runtime 会话，优先 TensorRT > CUDA > CPU；TensorRT 加载失败时自动降级。"""
-    onnx_path = str(Path(onnx_path).expanduser().resolve())
+    """创建 ONNX Runtime 会话，优先 TensorRT > CUDA > CPU；TensorRT 加载失败时自动降级。
+
+    TensorRT 引擎会缓存在 ``trt_engine_cache_path`` 指定目录（默认：与 ONNX 同级的
+    ``trt_engine_cache``，或通过环境变量 ``ORT_TRT_ENGINE_CACHE`` 设置），下次启动直接加载缓存，
+    无需重新编译（模型/TRT 选项未变时）。
+    """
+    onnx_path_resolved = Path(onnx_path).expanduser().resolve()
+    onnx_path = str(onnx_path_resolved)
+    trt_cache = _resolve_trt_engine_cache_path(onnx_path_resolved, trt_engine_cache_path)
+
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-    providers = _build_provider_list(prefer_gpu, gpu_mem_limit, try_trt=True)
+    providers = _build_provider_list(
+        prefer_gpu, gpu_mem_limit, try_trt=True, trt_engine_cache_path=trt_cache
+    )
 
     has_trt = any(
         (p[0] if isinstance(p, tuple) else p) == "TensorrtExecutionProvider"
@@ -231,7 +294,9 @@ def create_rec_session(
         try:
             return ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
         except Exception:
-            providers = _build_provider_list(prefer_gpu, gpu_mem_limit, try_trt=False)
+            providers = _build_provider_list(
+                prefer_gpu, gpu_mem_limit, try_trt=False, trt_engine_cache_path=trt_cache
+            )
 
     return ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
 
@@ -246,13 +311,17 @@ class PPOcrRecOnnxGpu:
         *,
         prefer_gpu: bool = True,
         gpu_mem_limit: Optional[int] = None,
+        trt_engine_cache_path: Optional[Union[str, Path]] = None,
     ):
         self.yml_path = Path(yml_path).expanduser().resolve()
         cfg = _load_inference_yml(self.yml_path)
         self._image_shape = _rec_image_shape_from_yml(cfg)
         self._character = _character_list_from_yml(cfg)
         self._session = create_rec_session(
-            onnx_path, prefer_gpu=prefer_gpu, gpu_mem_limit=gpu_mem_limit
+            onnx_path,
+            prefer_gpu=prefer_gpu,
+            gpu_mem_limit=gpu_mem_limit,
+            trt_engine_cache_path=trt_engine_cache_path,
         )
         inp = self._session.get_inputs()
         self._input_name = inp[0].name
@@ -306,6 +375,7 @@ def infer_rec_text_gpu(
     *,
     session: Optional[PPOcrRecOnnxGpu] = None,
     prefer_gpu: bool = True,
+    trt_engine_cache_path: Optional[Union[str, Path]] = None,
 ) -> str:
     """
     便捷函数：输入 BGR 图片数组，输出文本。
@@ -322,13 +392,20 @@ def infer_rec_text_gpu(
         若提供则忽略 ``onnx_path`` / ``yml_path``，直接使用该会话推理。
     prefer_gpu :
         是否优先使用 CUDA EP。
+    trt_engine_cache_path :
+        TensorRT 引擎缓存目录；``None`` 时见 ``create_rec_session`` 说明。
     """
     if session is not None:
         return session.infer(image)
     base = Path(__file__).resolve().parent.parent / "output" / "onnx_model"
     onnx_path = Path(onnx_path or base / "inference.onnx").expanduser().resolve()
     yml_path = Path(yml_path or base / "inference.yml").expanduser().resolve()
-    rec = PPOcrRecOnnxGpu(onnx_path, yml_path, prefer_gpu=prefer_gpu)
+    rec = PPOcrRecOnnxGpu(
+        onnx_path,
+        yml_path,
+        prefer_gpu=prefer_gpu,
+        trt_engine_cache_path=trt_engine_cache_path,
+    )
     return rec.infer(image)
 
 
@@ -341,12 +418,12 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    image = cv2.imread("/home/unitx/CJM/train_ocr_data/test2.bmp")
+    image = cv2.imread("/home/unitx/CJM/train_ocr_data/test.bmp")
 
     base = Path(__file__).resolve().parent.parent / "output" / "onnx_model"
     onnx_path = Path(base / "inference.onnx").expanduser().resolve()
     yml_path = Path(base / "inference.yml").expanduser().resolve()
-    rec = PPOcrRecOnnxGpu(onnx_path, yml_path, prefer_gpu=True)
+    rec = PPOcrRecOnnxGpu(onnx_path, yml_path, prefer_gpu=True, trt_engine_cache_path=Path(__file__).resolve().parent / "trt_engine_cache")
 
     for i in range(0,10):
         _ = rec.infer(image)
