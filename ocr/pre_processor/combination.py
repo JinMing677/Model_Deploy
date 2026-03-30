@@ -99,6 +99,7 @@ def stitch_horizontal_overlap(
     background: Tuple[int, int, int] = (255, 255, 255),
     texture: Optional[Array] = None,
     rng: Optional[np.random.Generator] = None,
+    backend_indices: Optional[List[int]] = None,
 ) -> Array:
     """
     水平拼接。``overlap_ratio`` 可为标量（每对相邻图相同）或长度 ``len(images)-1`` 的序列，
@@ -106,6 +107,8 @@ def stitch_horizontal_overlap(
 
     若传入 ``texture``，画布（含纵向对齐产生的上下留白）先用纹理随机平铺/裁切铺底，再叠放各图；
     否则用 ``background`` 纯色填充。
+
+    ``backend_indices`` 指定 images 中哪些位置是 backend 图。backend 图使用纹理平铺而非拉伸。
     """
     if not images:
         raise ValueError("images 为空")
@@ -115,40 +118,65 @@ def stitch_horizontal_overlap(
     if n == 1:
         ratios = []
     elif np.isscalar(overlap_ratio):
-        r = float(np.clip(float(overlap_ratio), 0.0, 0.95))
-        ratios = [r] * (n - 1)
+        r_val = float(np.clip(float(overlap_ratio), 0.0, 0.95))
+        ratios = [r_val] * (n - 1)
     else:
         seq = list(overlap_ratio)
         if len(seq) != n - 1:
             raise ValueError(f"overlap_ratio 序列长度应为 {n - 1}，得到 {len(seq)}")
         ratios = [float(np.clip(float(x), 0.0, 0.95)) for x in seq]
 
-    placements: List[Tuple[int, int, Array]] = []
+    placements: List[Tuple[int, int, Array, bool]] = []
     x_cursor = 0
     for i, im in enumerate(images):
         h, w = im.shape[:2]
+        is_backend = backend_indices is not None and i in backend_indices
         pad_top = (H - h) // 2
         if i == 0:
-            placements.append((x_cursor, pad_top, im))
+            placements.append((x_cursor, pad_top, im, is_backend))
             x_cursor += w
         else:
             prev_w = images[i - 1].shape[1]
-            r = ratios[i - 1]
-            overlap_px = int(min(prev_w, w) * r)
+            r_val = ratios[i - 1]
+            overlap_px = int(min(prev_w, w) * r_val)
             overlap_px = max(0, min(overlap_px, w - 1, prev_w - 1))
             x_cursor = x_cursor - overlap_px
-            placements.append((x_cursor, pad_top, im))
+            placements.append((x_cursor, pad_top, im, is_backend))
             x_cursor += w
 
     W = max(1, x_cursor)
+    r = rng or np.random.default_rng()
     if texture is not None:
-        r = rng or np.random.default_rng()
         canvas = _sample_texture_patch(_ensure_rgb_uint8(texture), H, W, r)
     else:
         canvas = np.full((H, W, 3), background, dtype=np.uint8)
-    for x0, y0, im in placements:
+
+    for x0, y0, im, is_backend in placements:
         h, w = im.shape[:2]
-        canvas[y0 : y0 + h, x0 : x0 + w] = im
+        canvas_h, canvas_w = canvas.shape[:2]
+        avail_w = max(0, canvas_w - x0)
+        y_start = max(0, y0)
+        y_end = min(y0 + h, canvas_h)
+        actual_h = y_end - y_start
+
+        if is_backend:
+            # backend 图根据尺寸决定平铺或裁剪
+            if w <= avail_w:
+                # 宽度不足，平铺多个 backend 图
+                x_pos = 0
+                while x_pos < avail_w:
+                    tile_w = min(w, avail_w - x_pos)
+                    tile_patch = im[:actual_h, :tile_w]
+                    canvas[y_start:y_end, x0 + x_pos:x0 + x_pos + tile_w] = tile_patch
+                    x_pos += tile_w
+            else:
+                # 宽度超出，裁剪多余部分（从左侧开始）
+                crop_w = min(w, avail_w)
+                canvas[y_start:y_end, x0:x0 + crop_w] = im[:actual_h, :crop_w]
+        else:
+            actual_w = min(w, avail_w)
+            if actual_w > 0 and actual_h > 0:
+                canvas[y0:y0 + actual_h, x0:x0 + actual_w] = im[:actual_h, :actual_w]
     return canvas
 
 
@@ -164,22 +192,23 @@ def combine_line_augmentation(
     background: Tuple[int, int, int] = (255, 255, 255),
 ) -> Tuple[Array, str]:
     """
-    从 char_images 中随机选若干张字符图（不含 'backend'），缩放、遮挡后水平拼接。
+    从 char_images 中随机选若干张字符图（含 'backend'），缩放、遮挡后水平拼接。
+    'backend' 图参与拼接但不出现在标签中；其尺寸不匹配时通过平铺或裁剪处理，不会拉伸。
 
     Parameters
     ----------
     char_images :
-        字符 -> RGB 图像。键 'backend' 为纹理图，用于遮挡填充，不出现在标签中。
+        字符 -> RGB 图像。键 'backend' 为纹理图，既用于遮挡填充也参与拼接（不出标签）。
     concat_count_range :
         拼接段数 [min, max]，闭区间。
     overlap_ratio_range :
         相邻图重叠占 min(左宽, 右宽) 的比例范围。
     scale_range :
-        每张字符图相对原尺寸的缩放系数范围。
+        每张字符图相对原尺寸的缩放系数范围（对 'backend' 图无效）。
     occlusion_ratio_range :
         单张图上用纹理替换的近似面积比例范围。
     charset :
-        允许参与拼接的字符集合；默认使用除 'backend' 外所有键。
+        允许参与拼接的字符键集合；默认使用除 'backend' 外所有键。
     rng :
         随机数生成器；默认 ``np.random.default_rng()``。
     background :
@@ -189,7 +218,7 @@ def combine_line_augmentation(
     -------
     image : ndarray, uint8, shape (H, W, 3), RGB
     label : str
-        按从左到右拼接顺序连接的字符（每个键一个字符；多字符键则整体作为一段标签）。
+        按从左到右拼接顺序连接的字符（不含 ``backend``）。
     """
     rng = rng or np.random.default_rng()
     if "backend" not in char_images:
@@ -198,6 +227,7 @@ def combine_line_augmentation(
     texture = _ensure_rgb_uint8(char_images["backend"])
     keys = list(char_images.keys())
     keys_no_tex = [k for k in keys if k != "backend"]
+
     if not keys_no_tex:
         raise ValueError("除 'backend' 外至少需要一张字符图")
 
@@ -209,29 +239,41 @@ def combine_line_augmentation(
     else:
         pool = keys_no_tex
 
+    # 构建完整池（含 backend），用于选择
+    full_pool = pool + ["backend"]
+
     low, high = concat_count_range
     low = max(1, int(low))
     high = max(low, int(high))
     n = int(rng.integers(low, high + 1))
 
-    chosen: List[str] = [str(rng.choice(pool)) for _ in range(n)]
-    label = "".join(chosen)
+    chosen: List[str] = [str(rng.choice(full_pool)) for _ in range(n)]
+    # backend 不加入标签
+    label = "".join(k for k in chosen if k != "backend")
 
     processed: List[Array] = []
+    backend_indices: List[int] = []
     o_low, o_high = overlap_ratio_range
     s_low, s_high = scale_range
     occ_low, occ_high = occlusion_ratio_range
 
-    for ch in chosen:
+    for i, ch in enumerate(chosen):
         img = _ensure_rgb_uint8(char_images[ch])
         h0, w0 = img.shape[:2]
-        scale = float(rng.uniform(s_low, s_high))
-        nh = max(1, int(round(h0 * scale)))
-        nw = max(1, int(round(w0 * scale)))
-        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-        occ = float(rng.uniform(occ_low, occ_high))
-        resized = _apply_occlusion(resized, texture, occ, rng)
+        if ch == "backend":
+            # backend 图保持原尺寸，由 stitch_horizontal_overlap 根据尺寸进行平铺或裁剪
+            resized = img
+            backend_indices.append(i)
+        else:
+            scale = float(rng.uniform(s_low, s_high))
+            nh = max(1, int(round(h0 * scale)))
+            nw = max(1, int(round(w0 * scale)))
+            resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+            occ = float(rng.uniform(occ_low, occ_high))
+            resized = _apply_occlusion(resized, texture, occ, rng)
+
         processed.append(resized)
 
     if len(processed) <= 1:
@@ -244,6 +286,7 @@ def combine_line_augmentation(
         background=background,
         texture=texture,
         rng=rng,
+        backend_indices=backend_indices if backend_indices else None,
     )
     return out, label
 
@@ -267,14 +310,15 @@ def combination_augment(
     ----------
     char_images
         字符键 → RGB 图像；必须含 ``'backend'`` 纹理图。
+        ``'backend'`` 既作为纹理也参与拼接（不出现在标签中），其尺寸不匹配时通过平铺/裁剪处理。
     concat_count_range
         拼接段数 ``[min, max]``（闭区间）。
     overlap_ratio_range
         相邻两图重叠占 ``min(左宽, 右宽)`` 的比例范围，每一缝单独随机。
     scale_range
-        每张字符图相对原图的缩放系数范围。
+        每张字符图相对原图的缩放系数范围（对 ``backend`` 无效）。
     occlusion_ratio_range
-        每张字符图上用纹理替换的近似面积比例范围。
+        每张字符图上用纹理替换的近似面积比例范围（对 ``backend`` 无效）。
     charset
         参与抽样的字符键；``None`` 表示除 ``'backend'`` 外全部键。
     seed
